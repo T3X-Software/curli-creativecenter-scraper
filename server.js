@@ -13,97 +13,157 @@ function cleanText(s) {
 }
 
 /**
- * Helpers (NOVO)
+ * ===== Helpers NOVOS =====
  */
-async function dismissOverlays(page) {
-  // Fecha banners comuns (cookies/consent). Não quebra se não existir.
+async function dismissOverlays(root) {
+  // root pode ser page ou frame (ambos têm getByRole/locator)
   const candidates = [
-    page.getByRole("button", { name: /accept|agree|allow all|ok/i }),
-    page.getByRole("button", { name: /aceitar|concordo|permitir|ok/i }),
-    page.locator("button:has-text('Accept')"),
-    page.locator("button:has-text('Agree')"),
-    page.locator("button:has-text('Allow all')"),
-    page.locator("button:has-text('Aceitar')"),
-    page.locator("button:has-text('Concordo')"),
+    root.getByRole("button", { name: /accept|agree|allow all|ok/i }),
+    root.getByRole("button", { name: /aceitar|concordo|permitir|ok/i }),
+    root.locator("button:has-text('Accept')"),
+    root.locator("button:has-text('Agree')"),
+    root.locator("button:has-text('Allow all')"),
+    root.locator("button:has-text('Aceitar')"),
+    root.locator("button:has-text('Concordo')"),
   ];
 
   for (const c of candidates) {
     try {
       if (await c.first().isVisible({ timeout: 1500 })) {
         await c.first().click({ timeout: 5000 });
-        await page.waitForTimeout(400);
+        await root.waitForTimeout?.(400);
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 }
 
-async function selectRegion(page, regionName = "Brazil") {
-  // 1) Abrir o dropdown/combobox de região
-  const openDropdownCandidates = [
-    // Botões/controles com label explícito
-    page.getByRole("button", { name: /region/i }),
-    page.locator("button:has-text('Region')"),
-    page.getByRole("button", { name: /country|location/i }),
-    page.locator("button:has-text('Country')"),
-    page.locator("button:has-text('Location')"),
+function pickBestFrame(page) {
+  // Heurística: pega o frame com URL mais “real” e ligado ao domínio do TikTok/Creative Center
+  const frames = page.frames();
+  const scored = frames.map((f) => {
+    const url = f.url() || "";
+    let score = 0;
+    if (url.includes("ads.tiktok.com")) score += 5;
+    if (url.includes("creativecenter")) score += 5;
+    if (url.startsWith("about:blank")) score -= 5;
+    return { frame: f, url, score };
+  });
 
-    // Heurística: achar um bloco com texto Region e clicar no botão dentro
-    page.locator("div:has-text('Region') button").first(),
-    page.locator("div:has-text('Country') button").first(),
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.frame || page.mainFrame();
+}
 
-    // Heurística: às vezes é um combobox
-    page.locator('[role="combobox"]').first(),
+async function listButtonsInFrame(frame) {
+  // Lista textos de botões visíveis dentro do frame
+  return await frame.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll("button"));
+    const visible = (el) => {
+      const s = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return s.visibility !== "hidden" && s.display !== "none" && r.width > 0 && r.height > 0;
+    };
+    return btns
+      .filter(visible)
+      .map((b) => (b.innerText || "").replace(/\s+/g, " ").trim())
+      .filter((t) => t.length > 0)
+      .slice(0, 150);
+  });
+}
+
+async function openFiltersPanel(root) {
+  const candidates = [
+    root.getByRole("button", { name: /filter/i }),
+    root.locator("button:has-text('Filter')"),
+    root.locator("button[aria-label*='filter' i]"),
+    root.locator("[aria-label*='filter' i]"),
   ];
 
-  let opened = false;
-  for (const cand of openDropdownCandidates) {
+  for (const c of candidates) {
     try {
-      if (await cand.first().isVisible({ timeout: 2500 })) {
-        await cand.first().click({ timeout: 15000 });
-        opened = true;
+      if (await c.first().isVisible({ timeout: 2000 })) {
+        await c.first().click({ timeout: 15000 });
+        await root.waitForTimeout?.(800);
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+async function selectRegion(root, regionName = "Brazil") {
+  // 1) tenta abrir painel de filtros (se existir)
+  await openFiltersPanel(root);
+
+  // 2) tenta achar um combobox / input para país
+  const regionFieldCandidates = [
+    root.getByRole("combobox").first(),
+    root.locator('input[placeholder*="Region" i]').first(),
+    root.locator('input[placeholder*="Country" i]').first(),
+    root.locator('input[placeholder*="Search" i]').first(),
+    root.locator('input[type="text"]').first(),
+  ];
+
+  let field = null;
+  for (const cand of regionFieldCandidates) {
+    try {
+      if (await cand.isVisible({ timeout: 2500 })) {
+        field = cand;
         break;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
-  if (!opened) {
-    throw new Error("Não encontrei o controle de filtro de Region/Country na página.");
+  if (!field) {
+    throw new Error("Não encontrei campo (combobox/input) para escolher país/região (provável UI em iframe/portal diferente).");
   }
 
-  // 2) Clicar na opção Brazil (pode vir em portal)
-  const optionCandidates = [
-    page.getByRole("option", { name: new RegExp(`^${regionName}$`, "i") }),
-    page.locator(`[role="option"]:has-text("${regionName}")`).first(),
-    page.locator(`li:has-text("${regionName}")`).first(),
-    page.locator(`text=${regionName}`).first(),
+  await field.click({ timeout: 15000 });
+  await field.fill(regionName, { timeout: 15000 });
+  await root.waitForTimeout?.(600);
+
+  // 3) escolher a opção
+  const optCandidates = [
+    root.getByRole("option", { name: new RegExp(`^${regionName}$`, "i") }),
+    root.locator(`[role="option"]:has-text("${regionName}")`).first(),
+    root.locator(`li:has-text("${regionName}")`).first(),
+    root.locator(`text=${regionName}`).first(),
   ];
 
-  for (const opt of optionCandidates) {
+  for (const opt of optCandidates) {
     try {
       if (await opt.first().isVisible({ timeout: 6000 })) {
         await opt.first().click({ timeout: 15000 });
-        await page.waitForTimeout(1200);
-        return;
+        await root.waitForTimeout?.(800);
+        break;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
-  throw new Error(`Abri o dropdown, mas não encontrei a opção "${regionName}".`);
+  // 4) se tiver Apply/Confirm
+  const applyCandidates = [
+    root.getByRole("button", { name: /apply|confirm|ok|done/i }),
+    root.locator("button:has-text('Apply')"),
+    root.locator("button:has-text('Confirm')"),
+    root.locator("button:has-text('Done')"),
+  ];
+
+  for (const a of applyCandidates) {
+    try {
+      if (await a.first().isVisible({ timeout: 1500 })) {
+        await a.first().click({ timeout: 8000 });
+        await root.waitForTimeout?.(800);
+        break;
+      }
+    } catch {}
+  }
 }
 
-async function selectTimeRange(page, timeRangeLabel = "Last 7 days") {
-  // Abre dropdown do período
+async function selectTimeRange(root, timeRangeLabel = "Last 7 days") {
   const timeBtnCandidates = [
-    page.getByRole("button", { name: /last\s+7\s+days|last\s+14\s+days|last\s+30\s+days|today/i }),
-    page.locator("button").filter({ hasText: /Last\s+7\s+days|Last\s+30\s+days|Last\s+14\s+days|Today/i }).first(),
-    page.locator("div:has-text('Time Range') button").first(),
-    page.locator("div:has-text('Date') button").first(),
+    root.getByRole("button", { name: /last\s+7\s+days|last\s+14\s+days|last\s+30\s+days|today/i }),
+    root.locator("button").filter({ hasText: /Last\s+7\s+days|Last\s+30\s+days|Last\s+14\s+days|Today/i }).first(),
+    root.locator("div:has-text('Time Range') button").first(),
+    root.locator("div:has-text('Date') button").first(),
   ];
 
   let opened = false;
@@ -118,29 +178,34 @@ async function selectTimeRange(page, timeRangeLabel = "Last 7 days") {
   }
 
   if (!opened) {
-    throw new Error("Não encontrei o controle de filtro de período (time range).");
+    // não mata aqui; às vezes o default já é Last 7 days
+    console.log("[scrape] time-range control not found; continuing with default UI state");
+    return;
   }
 
-  // Seleciona opção do período
   const optCandidates = [
-    page.getByRole("option", { name: new RegExp(`^${timeRangeLabel}$`, "i") }),
-    page.locator(`[role="option"]:has-text("${timeRangeLabel}")`).first(),
-    page.locator(`li:has-text("${timeRangeLabel}")`).first(),
-    page.locator(`text=${timeRangeLabel}`).first(),
+    root.getByRole("option", { name: new RegExp(`^${timeRangeLabel}$`, "i") }),
+    root.locator(`[role="option"]:has-text("${timeRangeLabel}")`).first(),
+    root.locator(`li:has-text("${timeRangeLabel}")`).first(),
+    root.locator(`text=${timeRangeLabel}`).first(),
   ];
 
   for (const opt of optCandidates) {
     try {
       if (await opt.first().isVisible({ timeout: 6000 })) {
         await opt.first().click({ timeout: 15000 });
-        await page.waitForTimeout(1200);
+        await root.waitForTimeout?.(800);
         return;
       }
     } catch {}
   }
 
-  throw new Error(`Abri o dropdown de período, mas não encontrei "${timeRangeLabel}".`);
+  console.log(`[scrape] time-range option "${timeRangeLabel}" not found; continuing`);
 }
+
+/**
+ * ===== Debug endpoints =====
+ */
 
 app.post("/debug/open", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
@@ -148,7 +213,6 @@ app.post("/debug/open", async (req, res) => {
   const started = Date.now();
 
   try {
-    console.log("[debug/open] launching browser...");
     browser = await chromium.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -157,24 +221,20 @@ app.post("/debug/open", async (req, res) => {
     const page = await browser.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
 
-    console.log("[debug/open] goto...");
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
-
-    await dismissOverlays(page);
+    await page.waitForTimeout(1500);
 
     const title = await page.title();
-    console.log("[debug/open] title:", title);
-
     res.json({ ok: true, title, ms: Date.now() - started });
   } catch (e) {
-    console.error("[debug/open] error:", e);
     res.status(500).json({ ok: false, message: String(e), ms: Date.now() - started });
   } finally {
     if (browser) await browser.close();
   }
 });
 
-app.post("/debug/controls", async (req, res) => {
+// NOVO: debug por frame (pra você me colar e eu acertar o seletor definitivo)
+app.post("/debug/frames", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   let browser;
 
@@ -186,32 +246,39 @@ app.post("/debug/controls", async (req, res) => {
 
     const page = await browser.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(1500);
 
-    // Coleta textos dos botões visíveis (pra descobrirmos como a UI está nomeando)
-    const buttonTexts = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll("button"));
-      const visible = (el) => {
-        const s = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return s.visibility !== "hidden" && s.display !== "none" && r.width > 0 && r.height > 0;
-      };
+    const frames = page.frames();
+    const out = [];
 
-      return btns
-        .filter(visible)
-        .map((b) => (b.innerText || "").replace(/\s+/g, " ").trim())
-        .filter((t) => t.length > 0)
-        .slice(0, 120); // limita pra não explodir
-    });
+    for (const f of frames) {
+      const url = f.url();
+      let buttons = [];
+      try {
+        buttons = await listButtonsInFrame(f);
+      } catch {
+        buttons = [];
+      }
+      out.push({
+        frame_url: url,
+        buttons_sample: buttons.slice(0, 50),
+        buttons_count: buttons.length,
+      });
+    }
 
-    res.json({ ok: true, buttons_sample: buttonTexts });
+    res.json({ ok: true, frames: out });
   } catch (e) {
     res.status(500).json({ ok: false, message: String(e) });
   } finally {
     if (browser) await browser.close();
   }
 });
+
+/**
+ * ===== Scrape =====
+ */
 
 app.post("/scrape/creative-center/top-products", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
@@ -235,20 +302,23 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(1500);
 
-    // NOVO: fecha overlays (cookies etc.)
-    await dismissOverlays(page);
+    // IMPORTANTÍSSIMO: operar no frame certo
+    const root = pickBestFrame(page);
+    console.log("[scrape] picked frame:", root.url());
 
-    // 1) Selecionar Brazil (NOVO: mais robusto)
+    await dismissOverlays(root);
+
+    // 1) Selecionar Brazil
     console.log("[scrape] selecting region:", region);
-    await selectRegion(page, region);
+    await selectRegion(root, region);
 
-    // 2) Selecionar período Last 7 days (NOVO: mais robusto)
+    // 2) Selecionar período
     console.log("[scrape] selecting time range:", timeRangeLabel);
-    await selectTimeRange(page, timeRangeLabel);
+    await selectTimeRange(root, timeRangeLabel);
 
-    // 3) Esperar a tabela
+    // 3) Esperar tabela
     console.log("[scrape] waiting rows...");
-    const rowsLocator = page.locator("tr").filter({ hasText: /Details/i });
+    const rowsLocator = root.locator("tr").filter({ hasText: /Details/i });
     await rowsLocator.first().waitFor({ timeout: 60000 });
 
     const rowCount = await rowsLocator.count();
@@ -304,4 +374,3 @@ server.on("error", (err) => {
   console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
   app.listen(port, "0.0.0.0", () => console.log(`scraper listening on 0.0.0.0:${port}`));
 });
-
