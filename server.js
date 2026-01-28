@@ -276,6 +276,65 @@ app.post("/debug/frames", async (req, res) => {
   }
 });
 
+app.post("/debug/page-snapshot", async (req, res) => {
+  const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
+  let browser;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    const page = await browser.newPage();
+
+    // Deixa mais “humano”
+    await page.setViewportSize({ width: 1365, height: 768 });
+    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(2000);
+
+    const finalUrl = page.url();
+    const title = await page.title();
+
+    // Conteúdo bruto (pra saber se veio “vazio”)
+    const htmlLen = await page.evaluate(() => document.documentElement.outerHTML.length);
+    const textSample = await page.evaluate(() =>
+      (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 800)
+    );
+
+    // Contagens de elementos básicos
+    const counts = await page.evaluate(() => ({
+      buttons: document.querySelectorAll("button").length,
+      links: document.querySelectorAll("a").length,
+      inputs: document.querySelectorAll("input").length,
+      selects: document.querySelectorAll("select").length,
+      tables: document.querySelectorAll("table").length,
+      trs: document.querySelectorAll("tr").length,
+    }));
+
+    const screenshotBase64 = await page.screenshot({ type: "png", fullPage: true, encoding: "base64" });
+
+    res.json({
+      ok: true,
+      title,
+      finalUrl,
+      htmlLen,
+      textSample,
+      counts,
+      screenshotBase64,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: String(e) });
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
 /**
  * ===== Scrape =====
  */
@@ -374,3 +433,4 @@ server.on("error", (err) => {
   console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
   app.listen(port, "0.0.0.0", () => console.log(`scraper listening on 0.0.0.0:${port}`));
 });
+
