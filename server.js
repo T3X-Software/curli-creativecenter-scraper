@@ -169,6 +169,16 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, "::", () => console.log(`scraper listening on :${port}`));
-);
+
+const server = app.listen(port, "::", () => {
+  console.log(`scraper listening on [::]:${port}`);
+});
+
+server.on("error", (err) => {
+  console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
+  app.listen(port, "0.0.0.0", () =>
+    console.log(`scraper listening on 0.0.0.0:${port}`)
+  );
+});
+
 
