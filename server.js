@@ -169,6 +169,6 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, "0.0.0.0", () =>
-  console.log(`scraper listening on :${port}`)
+app.listen(port, "::", () => console.log(`scraper listening on :${port}`));
 );
+
