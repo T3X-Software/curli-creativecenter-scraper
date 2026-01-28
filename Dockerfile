@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.50.0-noble
+FROM mcr.microsoft.com/playwright:v1.58.0-noble
 
 WORKDIR /app
 COPY package.json ./
@@ -9,3 +9,4 @@ ENV NODE_ENV=production
 
 # Railway injeta PORT. A app já usa process.env.PORT
 CMD ["npm", "start"]
+
