@@ -174,6 +174,45 @@ app.post("/debug/open", async (req, res) => {
   }
 });
 
+app.post("/debug/controls", async (req, res) => {
+  const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
+  let browser;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    const page = await browser.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(1500);
+
+    // Coleta textos dos botões visíveis (pra descobrirmos como a UI está nomeando)
+    const buttonTexts = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button"));
+      const visible = (el) => {
+        const s = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return s.visibility !== "hidden" && s.display !== "none" && r.width > 0 && r.height > 0;
+      };
+
+      return btns
+        .filter(visible)
+        .map((b) => (b.innerText || "").replace(/\s+/g, " ").trim())
+        .filter((t) => t.length > 0)
+        .slice(0, 120); // limita pra não explodir
+    });
+
+    res.json({ ok: true, buttons_sample: buttonTexts });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: String(e) });
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
 app.post("/scrape/creative-center/top-products", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   const region = "Brazil";
@@ -265,3 +304,4 @@ server.on("error", (err) => {
   console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
   app.listen(port, "0.0.0.0", () => console.log(`scraper listening on 0.0.0.0:${port}`));
 });
+
