@@ -16,6 +16,14 @@ function cleanText(s) {
  * ===== Helpers =====
  */
 
+async function safeGoto(page, url) {
+  // ✅ Mais estável que networkidle direto (TikTok fica fazendo request infinito)
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
+  // tenta "acalmar" a rede, mas não trava se não conseguir
+  await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+}
+
 async function dismissOverlays(root) {
   const candidates = [
     root.getByRole("button", { name: /accept|agree|allow all|ok/i }),
@@ -64,20 +72,19 @@ function scoreFrameByUrl(url) {
 }
 
 async function pickBestFrame(page) {
-  // Heurística melhor: tenta achar o frame que realmente contém a tabela (Detalhes/Details)
+  // ✅ Heurística melhor: tenta achar o frame que contém "Detalhes/Details"
   const frames = page.frames();
 
-  // 1) tenta por conteúdo
   for (const f of frames) {
     try {
-      const maybe = f.locator("text=Detalhes, text=Details");
-      if (await maybe.first().isVisible({ timeout: 800 })) {
+      const maybe = f.locator("button:has-text('Detalhes'), button:has-text('Details')");
+      if (await maybe.first().isVisible({ timeout: 1200 })) {
         return f;
       }
     } catch {}
   }
 
-  // 2) fallback por URL
+  // fallback por URL
   const scored = frames
     .map((f) => ({ frame: f, url: f.url() || "", score: scoreFrameByUrl(f.url() || "") }))
     .sort((a, b) => b.score - a.score);
@@ -200,10 +207,11 @@ async function selectRegion(root, regionName = "Brasil") {
 }
 
 async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
-  // seu print mostra o botão “Últimos 7 dias”
   const timeBtnCandidates = [
     root.getByRole("button", { name: /últimos\s+7\s+dias|ultimos\s+7\s+dias|last\s+7\s+days/i }),
-    root.locator("button").filter({ hasText: /Últimos\s+7\s+dias|Last\s+7\s+days|Últimos\s+30\s+dias|Last\s+30\s+days/i }).first(),
+    root.locator("button")
+      .filter({ hasText: /Últimos\s+7\s+dias|Last\s+7\s+days|Últimos\s+30\s+dias|Last\s+30\s+days/i })
+      .first(),
   ];
 
   let opened = false;
@@ -242,6 +250,15 @@ async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
   console.log(`[scrape] time-range option "${timeRangeLabel}" not found; continuing`);
 }
 
+function newContextOpts() {
+  return {
+    viewport: { width: 1365, height: 768 },
+    locale: "pt-BR",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  };
+}
+
 /**
  * ===== Debug endpoints =====
  */
@@ -257,18 +274,11 @@ app.post("/debug/open", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1365, height: 768 },
-      locale: "pt-BR",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-
+    const context = await browser.newContext(newContextOpts());
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(1500);
+    await safeGoto(page, url);
 
     const title = await page.title();
     res.json({ ok: true, title, ms: Date.now() - started });
@@ -289,18 +299,11 @@ app.post("/debug/frames", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1365, height: 768 },
-      locale: "pt-BR",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-
+    const context = await browser.newContext(newContextOpts());
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(1500);
+    await safeGoto(page, url);
 
     const frames = page.frames();
     const out = [];
@@ -337,18 +340,11 @@ app.post("/debug/page-snapshot", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1365, height: 768 },
-      locale: "pt-BR",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-
+    const context = await browser.newContext(newContextOpts());
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(2000);
+    await safeGoto(page, url);
 
     const finalUrl = page.url();
     const title = await page.title();
@@ -367,6 +363,7 @@ app.post("/debug/page-snapshot", async (req, res) => {
       trs: document.querySelectorAll("tr").length,
     }));
 
+    // ✅ base64 real (string)
     const screenshotBase64 = await page.screenshot({
       type: "png",
       fullPage: true,
@@ -402,19 +399,12 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1365, height: 768 },
-      locale: "pt-BR",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-
+    const context = await browser.newContext(newContextOpts());
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     console.log("[scrape] goto...");
-    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(1500);
+    await safeGoto(page, url);
 
     const root = await pickBestFrame(page);
     console.log("[scrape] picked frame:", root.url());
@@ -426,6 +416,13 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
 
     console.log("[scrape] selecting time range:", timeRangeLabel);
     await selectTimeRange(root, timeRangeLabel);
+
+    // ✅ espera mais robusta: primeiro espera o botão Detalhes/Details existir
+    console.log("[scrape] waiting table controls...");
+    await root
+      .locator("button:has-text('Detalhes'), button:has-text('Details')")
+      .first()
+      .waitFor({ timeout: 60000 });
 
     console.log("[scrape] waiting rows...");
     const rowsLocator = root.locator("tr").filter({ hasText: /Details|Detalhes/i });
