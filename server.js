@@ -13,18 +13,19 @@ function cleanText(s) {
 }
 
 /**
- * ===== Helpers NOVOS =====
+ * ===== Helpers =====
  */
+
 async function dismissOverlays(root) {
-  // root pode ser page ou frame (ambos têm getByRole/locator)
   const candidates = [
     root.getByRole("button", { name: /accept|agree|allow all|ok/i }),
-    root.getByRole("button", { name: /aceitar|concordo|permitir|ok/i }),
+    root.getByRole("button", { name: /aceitar|concordo|permitir tudo|permitir|ok/i }),
     root.locator("button:has-text('Accept')"),
     root.locator("button:has-text('Agree')"),
     root.locator("button:has-text('Allow all')"),
     root.locator("button:has-text('Aceitar')"),
     root.locator("button:has-text('Concordo')"),
+    root.locator("button:has-text('Permitir tudo')"),
   ];
 
   for (const c of candidates) {
@@ -37,24 +38,7 @@ async function dismissOverlays(root) {
   }
 }
 
-function pickBestFrame(page) {
-  // Heurística: pega o frame com URL mais “real” e ligado ao domínio do TikTok/Creative Center
-  const frames = page.frames();
-  const scored = frames.map((f) => {
-    const url = f.url() || "";
-    let score = 0;
-    if (url.includes("ads.tiktok.com")) score += 5;
-    if (url.includes("creativecenter")) score += 5;
-    if (url.startsWith("about:blank")) score -= 5;
-    return { frame: f, url, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0]?.frame || page.mainFrame();
-}
-
 async function listButtonsInFrame(frame) {
-  // Lista textos de botões visíveis dentro do frame
   return await frame.evaluate(() => {
     const btns = Array.from(document.querySelectorAll("button"));
     const visible = (el) => {
@@ -70,10 +54,42 @@ async function listButtonsInFrame(frame) {
   });
 }
 
+function scoreFrameByUrl(url) {
+  let score = 0;
+  if (!url) return -999;
+  if (url.includes("ads.tiktok.com")) score += 5;
+  if (url.includes("creativecenter")) score += 5;
+  if (url.startsWith("about:blank")) score -= 5;
+  return score;
+}
+
+async function pickBestFrame(page) {
+  // Heurística melhor: tenta achar o frame que realmente contém a tabela (Detalhes/Details)
+  const frames = page.frames();
+
+  // 1) tenta por conteúdo
+  for (const f of frames) {
+    try {
+      const maybe = f.locator("text=Detalhes, text=Details");
+      if (await maybe.first().isVisible({ timeout: 800 })) {
+        return f;
+      }
+    } catch {}
+  }
+
+  // 2) fallback por URL
+  const scored = frames
+    .map((f) => ({ frame: f, url: f.url() || "", score: scoreFrameByUrl(f.url() || "") }))
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.frame || page.mainFrame();
+}
+
 async function openFiltersPanel(root) {
   const candidates = [
-    root.getByRole("button", { name: /filter/i }),
+    root.getByRole("button", { name: /filter|filtro/i }),
     root.locator("button:has-text('Filter')"),
+    root.locator("button:has-text('Filtro')"),
     root.locator("button[aria-label*='filter' i]"),
     root.locator("[aria-label*='filter' i]"),
   ];
@@ -90,38 +106,60 @@ async function openFiltersPanel(root) {
   return false;
 }
 
-async function selectRegion(root, regionName = "Brazil") {
-  // 1) tenta abrir painel de filtros (se existir)
+async function selectRegion(root, regionName = "Brasil") {
   await openFiltersPanel(root);
 
-  // 2) tenta achar um combobox / input para país
-  const regionFieldCandidates = [
-    root.getByRole("combobox").first(),
-    root.locator('input[placeholder*="Region" i]').first(),
-    root.locator('input[placeholder*="Country" i]').first(),
-    root.locator('input[placeholder*="Search" i]').first(),
-    root.locator('input[type="text"]').first(),
+  // Como seu print mostra um dropdown já exibindo "Brasil",
+  // tentamos clicar no botão que contém o texto do país atual
+  const regionBtnCandidates = [
+    root.getByRole("button", { name: /brasil|brazil|portugal|mexico|united states|canada|japan/i }),
+    root.locator("button").filter({ hasText: /Brasil|Brazil|United States|Canada|Mexico|Japan/i }).first(),
   ];
 
-  let field = null;
-  for (const cand of regionFieldCandidates) {
+  let opened = false;
+  for (const b of regionBtnCandidates) {
     try {
-      if (await cand.isVisible({ timeout: 2500 })) {
-        field = cand;
+      if (await b.first().isVisible({ timeout: 2500 })) {
+        await b.first().click({ timeout: 15000 });
+        opened = true;
         break;
       }
     } catch {}
   }
 
-  if (!field) {
-    throw new Error("Não encontrei campo (combobox/input) para escolher país/região (provável UI em iframe/portal diferente).");
+  // fallback: tenta achar qualquer combobox/input (se a UI mudou)
+  if (!opened) {
+    const regionFieldCandidates = [
+      root.getByRole("combobox").first(),
+      root.locator('input[placeholder*="Reg" i]').first(),
+      root.locator('input[placeholder*="Region" i]').first(),
+      root.locator('input[placeholder*="Pa" i]').first(),
+      root.locator('input[placeholder*="Country" i]').first(),
+      root.locator('input[placeholder*="Pesq" i]').first(),
+      root.locator('input[placeholder*="Search" i]').first(),
+      root.locator('input[type="text"]').first(),
+    ];
+
+    let field = null;
+    for (const cand of regionFieldCandidates) {
+      try {
+        if (await cand.isVisible({ timeout: 2000 })) {
+          field = cand;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!field) {
+      throw new Error("Não encontrei controle de Region/Country (dropdown/combobox/input) no frame escolhido.");
+    }
+
+    await field.click({ timeout: 15000 });
+    await field.fill(regionName, { timeout: 15000 });
+    await root.waitForTimeout?.(600);
   }
 
-  await field.click({ timeout: 15000 });
-  await field.fill(regionName, { timeout: 15000 });
-  await root.waitForTimeout?.(600);
-
-  // 3) escolher a opção
+  // escolher opção (PT/EN)
   const optCandidates = [
     root.getByRole("option", { name: new RegExp(`^${regionName}$`, "i") }),
     root.locator(`[role="option"]:has-text("${regionName}")`).first(),
@@ -139,17 +177,20 @@ async function selectRegion(root, regionName = "Brazil") {
     } catch {}
   }
 
-  // 4) se tiver Apply/Confirm
+  // Se tiver Apply/Confirm
   const applyCandidates = [
-    root.getByRole("button", { name: /apply|confirm|ok|done/i }),
+    root.getByRole("button", { name: /apply|confirm|ok|done|aplicar|confirmar|concluir/i }),
     root.locator("button:has-text('Apply')"),
     root.locator("button:has-text('Confirm')"),
     root.locator("button:has-text('Done')"),
+    root.locator("button:has-text('Aplicar')"),
+    root.locator("button:has-text('Confirmar')"),
+    root.locator("button:has-text('Concluir')"),
   ];
 
   for (const a of applyCandidates) {
     try {
-      if (await a.first().isVisible({ timeout: 1500 })) {
+      if (await a.first().isVisible({ timeout: 1200 })) {
         await a.first().click({ timeout: 8000 });
         await root.waitForTimeout?.(800);
         break;
@@ -158,12 +199,11 @@ async function selectRegion(root, regionName = "Brazil") {
   }
 }
 
-async function selectTimeRange(root, timeRangeLabel = "Last 7 days") {
+async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
+  // seu print mostra o botão “Últimos 7 dias”
   const timeBtnCandidates = [
-    root.getByRole("button", { name: /last\s+7\s+days|last\s+14\s+days|last\s+30\s+days|today/i }),
-    root.locator("button").filter({ hasText: /Last\s+7\s+days|Last\s+30\s+days|Last\s+14\s+days|Today/i }).first(),
-    root.locator("div:has-text('Time Range') button").first(),
-    root.locator("div:has-text('Date') button").first(),
+    root.getByRole("button", { name: /últimos\s+7\s+dias|ultimos\s+7\s+dias|last\s+7\s+days/i }),
+    root.locator("button").filter({ hasText: /Últimos\s+7\s+dias|Last\s+7\s+days|Últimos\s+30\s+dias|Last\s+30\s+days/i }).first(),
   ];
 
   let opened = false;
@@ -178,7 +218,6 @@ async function selectTimeRange(root, timeRangeLabel = "Last 7 days") {
   }
 
   if (!opened) {
-    // não mata aqui; às vezes o default já é Last 7 days
     console.log("[scrape] time-range control not found; continuing with default UI state");
     return;
   }
@@ -218,8 +257,15 @@ app.post("/debug/open", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
+    const page = await context.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(1500);
@@ -233,7 +279,6 @@ app.post("/debug/open", async (req, res) => {
   }
 });
 
-// NOVO: debug por frame (pra você me colar e eu acertar o seletor definitivo)
 app.post("/debug/frames", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   let browser;
@@ -244,8 +289,15 @@ app.post("/debug/frames", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
+    const page = await context.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(1500);
@@ -254,7 +306,6 @@ app.post("/debug/frames", async (req, res) => {
     const out = [];
 
     for (const f of frames) {
-      const url = f.url();
       let buttons = [];
       try {
         buttons = await listButtonsInFrame(f);
@@ -262,7 +313,7 @@ app.post("/debug/frames", async (req, res) => {
         buttons = [];
       }
       out.push({
-        frame_url: url,
+        frame_url: f.url(),
         buttons_sample: buttons.slice(0, 50),
         buttons_count: buttons.length,
       });
@@ -286,14 +337,15 @@ app.post("/debug/page-snapshot", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const page = await browser.newPage();
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
 
-    // Deixa mais “humano”
-    await page.setViewportSize({ width: 1365, height: 768 });
-    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    );
+    const page = await context.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(2000);
@@ -301,13 +353,11 @@ app.post("/debug/page-snapshot", async (req, res) => {
     const finalUrl = page.url();
     const title = await page.title();
 
-    // Conteúdo bruto (pra saber se veio “vazio”)
     const htmlLen = await page.evaluate(() => document.documentElement.outerHTML.length);
     const textSample = await page.evaluate(() =>
       (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 800)
     );
 
-    // Contagens de elementos básicos
     const counts = await page.evaluate(() => ({
       buttons: document.querySelectorAll("button").length,
       links: document.querySelectorAll("a").length,
@@ -317,17 +367,13 @@ app.post("/debug/page-snapshot", async (req, res) => {
       trs: document.querySelectorAll("tr").length,
     }));
 
-    const screenshotBase64 = await page.screenshot({ type: "png", fullPage: true, encoding: "base64" });
-
-    res.json({
-      ok: true,
-      title,
-      finalUrl,
-      htmlLen,
-      textSample,
-      counts,
-      screenshotBase64,
+    const screenshotBase64 = await page.screenshot({
+      type: "png",
+      fullPage: true,
+      encoding: "base64",
     });
+
+    res.json({ ok: true, title, finalUrl, htmlLen, textSample, counts, screenshotBase64 });
   } catch (e) {
     res.status(500).json({ ok: false, message: String(e) });
   } finally {
@@ -341,8 +387,10 @@ app.post("/debug/page-snapshot", async (req, res) => {
 
 app.post("/scrape/creative-center/top-products", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
-  const region = "Brazil";
-  const timeRangeLabel = "Last 7 days";
+
+  // ✅ defaults que batem com sua UI (PT-BR)
+  const region = req.body?.region || "Brasil";
+  const timeRangeLabel = req.body?.timeRangeLabel || "Últimos 7 dias";
 
   let browser;
   const started = Date.now();
@@ -354,30 +402,33 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
+    const page = await context.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     console.log("[scrape] goto...");
     await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(1500);
 
-    // IMPORTANTÍSSIMO: operar no frame certo
-    const root = pickBestFrame(page);
+    const root = await pickBestFrame(page);
     console.log("[scrape] picked frame:", root.url());
 
     await dismissOverlays(root);
 
-    // 1) Selecionar Brazil
     console.log("[scrape] selecting region:", region);
     await selectRegion(root, region);
 
-    // 2) Selecionar período
     console.log("[scrape] selecting time range:", timeRangeLabel);
     await selectTimeRange(root, timeRangeLabel);
 
-    // 3) Esperar tabela
     console.log("[scrape] waiting rows...");
-    const rowsLocator = root.locator("tr").filter({ hasText: /Details/i });
+    const rowsLocator = root.locator("tr").filter({ hasText: /Details|Detalhes/i });
     await rowsLocator.first().waitFor({ timeout: 60000 });
 
     const rowCount = await rowsLocator.count();
@@ -433,4 +484,3 @@ server.on("error", (err) => {
   console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
   app.listen(port, "0.0.0.0", () => console.log(`scraper listening on 0.0.0.0:${port}`));
 });
-
