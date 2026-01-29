@@ -1,30 +1,75 @@
+/**
+ * Curli — TikTok Creative Center Scraper (Top Products)
+ * Caminho A: extrair a TABELA em JSON (items) e retornar pronto pro n8n → Google Sheets
+ *
+ * Endpoints:
+ *  - GET  /health
+ *  - POST /scrape/creative-center/top-products   ✅ retorna items (JSON)
+ *  - POST /debug/open
+ *  - POST /debug/frames
+ *  - POST /debug/page-snapshot
+ */
+
 const express = require("express");
 const { chromium } = require("playwright");
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "scraper", ts: new Date().toISOString() });
-});
-
+/** =========================
+ *  Utils
+ *  ========================= */
 function cleanText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
 
-/**
- * ===== Helpers =====
- */
+function msNow(started) {
+  return Date.now() - started;
+}
 
-async function safeGoto(page, url) {
-  // ✅ Mais estável que networkidle direto (TikTok fica fazendo request infinito)
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-  // tenta "acalmar" a rede, mas não trava se não conseguir
-  await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-  await page.waitForTimeout(1500);
+function scoreFrameByUrl(url) {
+  let score = 0;
+  if (!url) return -999;
+  if (url.includes("ads.tiktok.com")) score += 5;
+  if (url.includes("creativecenter")) score += 5;
+  if (url.includes("top-products")) score += 4;
+  if (url.startsWith("about:blank")) score -= 5;
+  return score;
+}
+
+function normalizeHeaderToKey(h) {
+  const header = cleanText(h).toLowerCase();
+
+  // PT-BR
+  if (header.includes("produto")) return "product";
+  if (header.includes("popularidade")) return "popularity";
+  if (header.includes("mud") || header.includes("varia") || header.includes("change")) return "popularity_change";
+  if (header === "ctr" || header.includes("ctr")) return "ctr";
+  if (header === "cvr" || header.includes("cvr")) return "cvr";
+  if (header === "cpa" || header.includes("cpa")) return "cpa";
+  if (header.includes("custo") || header.includes("cost")) return "cost";
+  if (header.includes("impress")) return "impressions";
+  if (header.includes("curt") || header.includes("like")) return "likes";
+  if (header.includes("coment")) return "comments";
+  if (header.includes("compart") || header.includes("share")) return "shares";
+  if (header.includes("view rate") || header.includes("taxa de visual")) return "view_rate";
+  if (header.includes("6s")) return "view_rate_6s";
+
+  // EN
+  if (header.includes("product")) return "product";
+  if (header.includes("popularity")) return "popularity";
+
+  // fallback: transforma em key segura
+  return header
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
 }
 
 async function dismissOverlays(root) {
+  // root pode ser page ou frame (ambos têm locator/getByRole)
   const candidates = [
     root.getByRole("button", { name: /accept|agree|allow all|ok/i }),
     root.getByRole("button", { name: /aceitar|concordo|permitir tudo|permitir|ok/i }),
@@ -62,29 +107,18 @@ async function listButtonsInFrame(frame) {
   });
 }
 
-function scoreFrameByUrl(url) {
-  let score = 0;
-  if (!url) return -999;
-  if (url.includes("ads.tiktok.com")) score += 5;
-  if (url.includes("creativecenter")) score += 5;
-  if (url.startsWith("about:blank")) score -= 5;
-  return score;
-}
-
 async function pickBestFrame(page) {
-  // ✅ Heurística melhor: tenta achar o frame que contém "Detalhes/Details"
   const frames = page.frames();
 
+  // 1) tenta por conteúdo (linha Detalhes/Details)
   for (const f of frames) {
     try {
-      const maybe = f.locator("button:has-text('Detalhes'), button:has-text('Details')");
-      if (await maybe.first().isVisible({ timeout: 1200 })) {
-        return f;
-      }
+      const maybe = f.locator("text=Detalhes, text=Details");
+      if (await maybe.first().isVisible({ timeout: 800 })) return f;
     } catch {}
   }
 
-  // fallback por URL
+  // 2) fallback por URL
   const scored = frames
     .map((f) => ({ frame: f, url: f.url() || "", score: scoreFrameByUrl(f.url() || "") }))
     .sort((a, b) => b.score - a.score);
@@ -116,8 +150,7 @@ async function openFiltersPanel(root) {
 async function selectRegion(root, regionName = "Brasil") {
   await openFiltersPanel(root);
 
-  // Como seu print mostra um dropdown já exibindo "Brasil",
-  // tentamos clicar no botão que contém o texto do país atual
+  // tenta clicar no dropdown que já mostra o país atual
   const regionBtnCandidates = [
     root.getByRole("button", { name: /brasil|brazil|portugal|mexico|united states|canada|japan/i }),
     root.locator("button").filter({ hasText: /Brasil|Brazil|United States|Canada|Mexico|Japan/i }).first(),
@@ -134,7 +167,7 @@ async function selectRegion(root, regionName = "Brasil") {
     } catch {}
   }
 
-  // fallback: tenta achar qualquer combobox/input (se a UI mudou)
+  // fallback: tenta campo de texto/combobox
   if (!opened) {
     const regionFieldCandidates = [
       root.getByRole("combobox").first(),
@@ -184,7 +217,7 @@ async function selectRegion(root, regionName = "Brasil") {
     } catch {}
   }
 
-  // Se tiver Apply/Confirm
+  // Apply/Confirm se existir
   const applyCandidates = [
     root.getByRole("button", { name: /apply|confirm|ok|done|aplicar|confirmar|concluir/i }),
     root.locator("button:has-text('Apply')"),
@@ -209,9 +242,7 @@ async function selectRegion(root, regionName = "Brasil") {
 async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
   const timeBtnCandidates = [
     root.getByRole("button", { name: /últimos\s+7\s+dias|ultimos\s+7\s+dias|last\s+7\s+days/i }),
-    root.locator("button")
-      .filter({ hasText: /Últimos\s+7\s+dias|Last\s+7\s+days|Últimos\s+30\s+dias|Last\s+30\s+days/i })
-      .first(),
+    root.locator("button").filter({ hasText: /Últimos\s+7\s+dias|Last\s+7\s+days|Últimos\s+30\s+dias|Last\s+30\s+days/i }).first(),
   ];
 
   let opened = false;
@@ -226,6 +257,7 @@ async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
   }
 
   if (!opened) {
+    // às vezes o default já é o certo
     console.log("[scrape] time-range control not found; continuing with default UI state");
     return;
   }
@@ -250,19 +282,110 @@ async function selectTimeRange(root, timeRangeLabel = "Últimos 7 dias") {
   console.log(`[scrape] time-range option "${timeRangeLabel}" not found; continuing`);
 }
 
-function newContextOpts() {
+/**
+ * Extrai tabela como JSON:
+ * - tenta ler headers do THEAD (se existir)
+ * - senão infere a partir da 1ª linha (menos confiável)
+ */
+async function extractTopProductsTable(root) {
+  // garante que existe alguma linha com Detalhes/Details
+  const rowsLocator = root.locator("tr").filter({ hasText: /Details|Detalhes/i });
+  await rowsLocator.first().waitFor({ timeout: 60000 });
+
+  // tenta achar tabela "mais próxima"
+  // (muitas UIs têm várias tabelas; esta heurística foca na que contém as linhas com Details/Detalhes)
+  const table = root.locator("table").filter({ has: rowsLocator.first() }).first();
+
+  // headers
+  let headers = [];
+  try {
+    const theadHeaders = table.locator("thead tr th");
+    if ((await theadHeaders.count()) > 0) {
+      headers = await theadHeaders.allInnerTexts();
+      headers = headers.map(cleanText).filter(Boolean);
+    }
+  } catch {}
+
+  // fallback: tenta pegar a 1ª linha de dados como “pseudo-header” (não ideal)
+  if (headers.length === 0) {
+    // tenta localizar qualquer th na página
+    const ths = root.locator("th");
+    if ((await ths.count()) > 0) {
+      headers = (await ths.allInnerTexts()).map(cleanText).filter(Boolean);
+    }
+  }
+
+  // map de índice → key
+  const headerKeys = headers.map(normalizeHeaderToKey);
+
+  const rowCount = await rowsLocator.count();
+  const items = [];
+
+  for (let i = 0; i < rowCount; i++) {
+    const row = rowsLocator.nth(i);
+    const cells = row.locator("td");
+    const cellCount = await cells.count();
+
+    // normalmente tem: Produto + várias métricas + um botão Detalhes no fim
+    if (cellCount < 3) continue;
+
+    const cellTexts = [];
+    for (let c = 0; c < cellCount; c++) {
+      cellTexts.push(cleanText(await cells.nth(c).innerText()));
+    }
+
+    // remove a última célula se for só “Detalhes/Details”
+    const last = cellTexts[cellTexts.length - 1]?.toLowerCase?.() || "";
+    if (last === "details" || last === "detalhes") {
+      cellTexts.pop();
+    }
+
+    // cria objeto
+    const obj = {};
+
+    if (headerKeys.length > 0) {
+      // usa os headers se baterem em quantidade (ou quase)
+      for (let idx = 0; idx < cellTexts.length; idx++) {
+        const key = headerKeys[idx] || `col_${idx + 1}`;
+        obj[key] = cellTexts[idx];
+      }
+    } else {
+      // fallback “fixo” (se não conseguiu ler header)
+      // ordem mais comum:
+      // 0 product, 1 popularity, 2 popularity_change, 3 ctr, 4 cvr, 5 cpa, ...
+      obj.product = cellTexts[0] || "";
+      obj.popularity = cellTexts[1] || "";
+      obj.popularity_change = cellTexts[2] || "";
+      obj.ctr = cellTexts[3] || "";
+      obj.cvr = cellTexts[4] || "";
+      obj.cpa = cellTexts[5] || "";
+      // extras
+      for (let idx = 6; idx < cellTexts.length; idx++) {
+        obj[`col_${idx + 1}`] = cellTexts[idx];
+      }
+    }
+
+    // saneamento mínimo
+    if (obj.product && obj.product.length > 1) items.push(obj);
+  }
+
   return {
-    viewport: { width: 1365, height: 768 },
-    locale: "pt-BR",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    headers,
+    headerKeys,
+    items,
   };
 }
 
-/**
- * ===== Debug endpoints =====
- */
+/** =========================
+ *  Routes
+ *  ========================= */
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "scraper", ts: new Date().toISOString() });
+});
 
+/**
+ * DEBUG: só abre a página e retorna título
+ */
 app.post("/debug/open", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   let browser;
@@ -274,21 +397,30 @@ app.post("/debug/open", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext(newContextOpts());
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await safeGoto(page, url);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(1500);
 
-    const title = await page.title();
-    res.json({ ok: true, title, ms: Date.now() - started });
+    res.json({ ok: true, title: await page.title(), finalUrl: page.url(), ms: msNow(started) });
   } catch (e) {
-    res.status(500).json({ ok: false, message: String(e), ms: Date.now() - started });
+    res.status(500).json({ ok: false, message: String(e), ms: msNow(started) });
   } finally {
     if (browser) await browser.close();
   }
 });
 
+/**
+ * DEBUG: lista frames + botões visíveis (pra diagnosticar UI)
+ */
 app.post("/debug/frames", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   let browser;
@@ -299,11 +431,18 @@ app.post("/debug/frames", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext(newContextOpts());
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await safeGoto(page, url);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(1500);
 
     const frames = page.frames();
     const out = [];
@@ -317,6 +456,7 @@ app.post("/debug/frames", async (req, res) => {
       }
       out.push({
         frame_url: f.url(),
+        score: scoreFrameByUrl(f.url()),
         buttons_sample: buttons.slice(0, 50),
         buttons_count: buttons.length,
       });
@@ -330,6 +470,10 @@ app.post("/debug/frames", async (req, res) => {
   }
 });
 
+/**
+ * DEBUG: snapshot (textSample + counts + screenshot em base64)
+ * ⚠️ ATENÇÃO: screenshot pode ser pesado; use quando precisar.
+ */
 app.post("/debug/page-snapshot", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
   let browser;
@@ -340,14 +484,21 @@ app.post("/debug/page-snapshot", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext(newContextOpts());
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
-    await safeGoto(page, url);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(2000);
 
-    const finalUrl = page.url();
     const title = await page.title();
+    const finalUrl = page.url();
 
     const htmlLen = await page.evaluate(() => document.documentElement.outerHTML.length);
     const textSample = await page.evaluate(() =>
@@ -363,7 +514,6 @@ app.post("/debug/page-snapshot", async (req, res) => {
       trs: document.querySelectorAll("tr").length,
     }));
 
-    // ✅ base64 real (string)
     const screenshotBase64 = await page.screenshot({
       type: "png",
       fullPage: true,
@@ -379,15 +529,21 @@ app.post("/debug/page-snapshot", async (req, res) => {
 });
 
 /**
- * ===== Scrape =====
+ * ✅ SCRAPE PRINCIPAL (Caminho A)
+ *
+ * Body opcional:
+ *  {
+ *    "region": "Brasil" | "Brazil",
+ *    "timeRangeLabel": "Últimos 7 dias" | "Last 7 days",
+ *    "includeScreenshot": false
+ *  }
  */
-
 app.post("/scrape/creative-center/top-products", async (req, res) => {
   const url = "https://ads.tiktok.com/business/creativecenter/top-products/pc/en";
 
-  // ✅ defaults que batem com sua UI (PT-BR)
   const region = req.body?.region || "Brasil";
   const timeRangeLabel = req.body?.timeRangeLabel || "Últimos 7 dias";
+  const includeScreenshot = Boolean(req.body?.includeScreenshot);
 
   let browser;
   const started = Date.now();
@@ -399,12 +555,19 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext(newContextOpts());
+    const context = await browser.newContext({
+      viewport: { width: 1365, height: 768 },
+      locale: "pt-BR",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({ "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });
 
     console.log("[scrape] goto...");
-    await safeGoto(page, url);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+    await page.waitForTimeout(1500);
 
     const root = await pickBestFrame(page);
     console.log("[scrape] picked frame:", root.url());
@@ -417,67 +580,56 @@ app.post("/scrape/creative-center/top-products", async (req, res) => {
     console.log("[scrape] selecting time range:", timeRangeLabel);
     await selectTimeRange(root, timeRangeLabel);
 
-    // ✅ espera mais robusta: primeiro espera o botão Detalhes/Details existir
-    console.log("[scrape] waiting table controls...");
-    await root
-      .locator("button:has-text('Detalhes'), button:has-text('Details')")
-      .first()
-      .waitFor({ timeout: 60000 });
+    console.log("[scrape] extracting table...");
+    const { headers, headerKeys, items } = await extractTopProductsTable(root);
 
-    console.log("[scrape] waiting rows...");
-    const rowsLocator = root.locator("tr").filter({ hasText: /Details|Detalhes/i });
-    await rowsLocator.first().waitFor({ timeout: 60000 });
-
-    const rowCount = await rowsLocator.count();
-    console.log("[scrape] rowCount:", rowCount);
-
-    const data = [];
-    for (let i = 0; i < rowCount; i++) {
-      const row = rowsLocator.nth(i);
-      const cells = row.locator("td");
-      const cellCount = await cells.count();
-      if (cellCount < 5) continue;
-
-      const productCellText = cleanText(await cells.nth(0).innerText());
-      const popularity = cleanText(await cells.nth(1).innerText());
-      const popularity_change = cleanText(await cells.nth(2).innerText());
-      const ctr = cleanText(await cells.nth(3).innerText());
-      const cvr = cleanText(await cells.nth(4).innerText());
-
-      let cpa = "";
-      if (cellCount >= 6) cpa = cleanText(await cells.nth(5).innerText());
-
-      data.push({ product: productCellText, popularity, popularity_change, ctr, cvr, cpa });
-    }
-
-    console.log("[scrape] done. items:", data.length);
-
-    res.json({
+    const payload = {
       ok: true,
+      source: "creative_center",
+      page_url: url,
       region,
       time_range: timeRangeLabel,
       collected_at: new Date().toISOString(),
-      source: "creative_center",
-      count: data.length,
-      ms: Date.now() - started,
-      data,
-    });
+      headers,
+      header_keys: headerKeys,
+      count: items.length,
+      ms: msNow(started),
+      items, // ✅ aqui estão os dados que você vai mandar pra planilha
+    };
+
+    if (includeScreenshot) {
+      // opcional (pra debug), evita ficar pesado sempre
+      const screenshotBase64 = await page.screenshot({
+        type: "png",
+        fullPage: true,
+        encoding: "base64",
+      });
+      payload.screenshotBase64 = screenshotBase64;
+    }
+
+    res.json(payload);
   } catch (e) {
     console.error("[scrape] error:", e);
-    res.status(500).json({ ok: false, message: String(e), ms: Date.now() - started });
+    res.status(500).json({
+      ok: false,
+      message: String(e),
+      ms: msNow(started),
+    });
   } finally {
     if (browser) await browser.close();
   }
 });
 
-// Listen robusto (não mexe)
+/** =========================
+ *  Listen
+ *  ========================= */
 const port = process.env.PORT || 8080;
 
-const server = app.listen(port, "::", () => {
-  console.log(`scraper listening on [::]:${port}`);
+// Railway/containers normalmente precisam 0.0.0.0
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`scraper listening on 0.0.0.0:${port}`);
 });
 
 server.on("error", (err) => {
-  console.error("Failed to bind on ::, falling back to 0.0.0.0", err);
-  app.listen(port, "0.0.0.0", () => console.log(`scraper listening on 0.0.0.0:${port}`));
+  console.error("Failed to bind server:", err);
 });
